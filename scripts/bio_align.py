@@ -4,168 +4,191 @@
 Sequence-based structural alignment of two proteins.
 """
 
-from __future__ import print_function, division
-
-import argparse
 import os
-from argparse import Namespace
+from pathlib import Path
 
-from Bio.PDB import PDBParser, FastMMCIFParser, Superimposer, PDBIO
+import requests
+from Bio.Align import substitution_matrices, PairwiseAligner
+from Bio.Data.PDBData import protein_letters_3to1
+from Bio.PDB import PDBParser, FastMMCIFParser, Superimposer, PDBIO, Structure, Select
+from Bio.PDB.PDBList import PDBList
 from Bio.PDB.Polypeptide import is_aa
 
-from Bio import pairwise2
-#from Bio.SubsMat import MatrixInfo as matlist
-from Bio.Data.SCOPData import protein_letters_3to1 as aa3to1
 
-def align_sequences(structA, structB, **kwargs):
+class AlignCystalStructures:
+
+    SUBST_MATRICES = list(map(str.lower, substitution_matrices.load()))
+
+    @staticmethod
+    def by_sequence(struct1: Structure,
+                    struct2: Structure,
+                    matrix: str = 'blosum62',
+                    gap_open: float = -10.0,
+                    gap_extend: float = -0.5,
+                    mapping: bool = False) -> tuple[str, str] | tuple[str, str, dict[int, int]]:
+        f"""Align the protein sequences of two protein structures using the Needleman-Wunsch algorithm.
+
+        :param struct1: First structure whose sequence to align to that of `struct2`.
+        :param struct2: Second structure whose sequence to align to that of `struct1`.
+        :param matrix: Substitution penality matrix (one of {AlignCystalStructures.SUBST_MATRICES}).
+        :param gap_open: Gap opening value.
+        :param gap_extend: Gap extending value.
+        :param mapping: should the indices of aligned residues be returned
+        :return: the aligned sequences, and if `mapping` is True, the amino acid mapping indices
+        """
+        if not matrix in AlignCystalStructures.SUBST_MATRICES:
+            raise ValueError('Invalid substitution penality matrix')
+        matrix = substitution_matrices.load(matrix.upper())
+        # Parse sequences with amino acid indices
+        resseq1 = extract_pdb_sequence(struct1, with_resseq=True)
+        resseq2 = extract_pdb_sequence(struct2, with_resseq=True)
+        seq1 = ''.join(list(zip(*resseq1))[1])
+        seq2 = ''.join(list(zip(*resseq2))[1])
+        # Align sequences
+        aligner = PairwiseAligner()
+        aligner.mode = 'global'
+        aligner.substitution_matrix = matrix
+        aligner.open_gap_score = gap_open
+        aligner.extend_gap_score = gap_extend
+        aligner.target_end_gap_score = 0.0
+        aligner.query_end_gap_score = 0.0
+        alns = aligner.align(seq1, seq2)
+        aligned1, aligned2 = next(alns)
+        # Renumber residues relative to the reference
+        if not mapping:
+            return aligned1, aligned2
+        mapping_ = {}
+        new_index1, new_index2 = 0, 0
+        for i, (aligned_aa1, aligned_aa2) in enumerate(zip(aligned1, aligned2)):
+            if aligned_aa1 == '-' and aligned_aa2 != '-':
+                    new_index2 += 1
+            elif aligned_aa2 == '-' and aligned_aa1 != '-':
+                    new_index1 += 1
+            elif aligned_aa1 == '-' and aligned_aa2 == '-':
+                    raise ValueError(f'Both aligned sequences contain a gap at index {i}.')
+            else:
+                assert resseq1[new_index1][1] == aligned_aa1
+                assert resseq2[new_index2][1] == aligned_aa2
+                mapping_[resseq1[new_index1][0]] = resseq2[new_index2][0]
+                new_index1 += 1
+                new_index2 += 1
+        return aligned1, aligned2, mapping_
+
+    @staticmethod
+    def by_coordinates(reference: Structure,
+                       mobile: Structure,
+                       ref_chain: str = 'A',
+                       mobile_chain: str = 'A') -> tuple[str, float]:
+        """Align two protein structures on their alpha carbons.
+
+        :param reference: the protein structure to superimpose `mobile` onto
+        :param mobile: the protein structure to be superimposed onto `reference`
+        :param ref_chain: the chain of `reference` to consider for superimposition
+        :param mobile_chain: the chain of `mobile` to consider for superimposition
+        :returns: the filename of the aligned protein structure and the RMSD between the aligned structures
+        """
+        # Parse structures & take only the necessary chain
+        try:
+            reference = reference[0][ref_chain]
+        except KeyError:
+            raise Exception('Chain {0} not found in reference structure'.format(ref_chain))
+        try:
+            mobile_struct = mobile[0][mobile_chain]
+        except KeyError:
+            raise Exception('Chain {0} not found in mobile structure'.format(mobile_chain))
+        # Align sequences to get mapping between residues
+        _, _, res_map = AlignCystalStructures.by_sequence(reference, mobile_struct, mapping=True)
+        # Identify alpha carbons of residues that align
+        ref_ca_list, mobile_ca_list = [], []
+        for ref_res in res_map:
+            ref_ca_list.append(reference[ref_res]['CA'])
+            mobile_ca_list.append(mobile_struct[res_map[ref_res]]['CA'])
+        # Superimpose matching residues
+        si = Superimposer()
+        si.set_atoms(ref_ca_list, mobile_ca_list)
+        # Transform & Write Mobile
+        si.apply(mobile_struct.get_atoms())
+        rmsd = si.rms
+        io = PDBIO()
+        io.set_structure(mobile_struct)
+        m_transformed_name = '{0}_transformed.pdb'.format(mobile.id)
+        io.save(m_transformed_name)
+        return m_transformed_name, rmsd
+
+
+def aligned_sequences_identity(seq1: str, seq2: str) -> float:
+    """Return the percentage of identical characters between two already aligned sequences."""
+    if len(seq1) != len(seq2):
+        raise ValueError('Sequences must have same length')
+    matches = [x == y for x, y in zip(seq1, seq2)]
+    seq_id = (100 * sum(matches)) / len( seq1)
+    return seq_id
+
+
+def extract_pdb_sequence(structure: Structure, with_resseq: bool = False) -> str | list[tuple[int, str]]:
+    """Retrieve the 1 letter protein sequence from a PDB structure.
+
+    :param structure: the PDB structure to extract sequence from
+    :param with_resseq: should the amino acid indices be returned
+    :returns: the protein sequence if `with_resseq` is False, otherwise a list of tuples
+    whose first items are amino acid indices and whose second items are the one letter amino acid codes.
     """
-    Performs a global pairwise alignment between two sequences
-    using the BLOSUM62 matrix and the Needleman-Wunsch algorithm
-    as implemented in Biopython. Returns the alignment, the sequence
-    identity and the residue mapping between both original sequences.
-    """
+    oneletter = lambda res: (res.id[1], protein_letters_3to1.get(res.resname, 'X'))
+    seq = [oneletter(res) for res in structure.get_residues() if is_aa(res)]
+    if not with_resseq:
+        return ''.join(list(zip(*seq))[1])
+    return seq
 
-    def _calculate_identity(sequenceA, sequenceB):
-        """
-        Returns the percentage of identical characters between two sequences.
-        Assumes the sequences are aligned.
-        """
 
-        sa, sb, sl = sequenceA, sequenceB, len(sequenceA)
-        matches = [sa[i] == sb[i] for i in range(sl)]
-        seq_id = (100 * sum(matches)) / sl
-
-        gapless_sl = sum([1 for i in range(sl) if (sa[i] != '-' and sb[i] != '-')])
-        gap_id = (100 * sum(matches)) / gapless_sl
-        return (seq_id, gap_id)
-
-    def _get_pdb_sequence(structure):
-        """
-        Retrieves the AA sequence from a PDB structure.
-        """
-
-        _aainfo = lambda r: (r.id[1], aa3to1.get(r.resname, 'X'))
-        seq = [_aainfo(r) for r in structure.get_residues() if is_aa(r)]
-        return seq
-
-    matrix = kwargs.get('matrix', matlist.blosum62)
-    gap_open = kwargs.get('gap_open', -10.0)
-    gap_extend = kwargs.get('gap_extend', -0.5)
-    trim_ends = kwargs.get('trim_ends', True)
-
-    resseq_A = _get_pdb_sequence(structA)
-    resseq_B = _get_pdb_sequence(structB)
-
-    sequence_A = ''.join([i[1] for i in resseq_A])
-    sequence_B = ''.join([i[1] for i in resseq_B])
-    alns = pairwise2.align.globalds(sequence_A, sequence_B,
-                                    matrix, gap_open, gap_extend,
-                                    penalize_end_gaps=(False, False) )
-
-    best_aln = alns[0]
-    aligned_A, aligned_B, score, begin, end = best_aln
-
-    # Equivalent residue numbering
-    # Relative to reference
-    mapping = {}
-    aa_i_A, aa_i_B = 0, 0
-    for aln_i, (aa_aln_A, aa_aln_B) in enumerate(zip(aligned_A, aligned_B)):
-        if aa_aln_A == '-':
-            if aa_aln_B != '-':
-                aa_i_B += 1
-        elif aa_aln_B == '-':
-            if aa_aln_A != '-':
-                aa_i_A += 1
-        else:
-            assert resseq_A[aa_i_A][1] == aa_aln_A
-            assert resseq_B[aa_i_B][1] == aa_aln_B
-            mapping[resseq_A[aa_i_A][0]] = resseq_B[aa_i_B][0]
-            aa_i_A += 1
-            aa_i_B += 1
-
-    # Gapless alignment
-    # def _trimmer(sequence):
-    #     """Returns indices of first and last ungapped position"""
-
-    #     leading = [i for (i, aa) in enumerate(sequence) if aa != '-'][0]
-    #     trailing = [i for (i, aa) in enumerate(sequence[::-1]) if aa != '-'][0]
-
-    #     trailing = len(sequence) - trailing
-    #     return (leading, trailing)
-
-    # lead_A, trail_A = _trimmer(aligned_A)
-    # lead_B, trail_B = _trimmer(aligned_B)
-
-    # lead = max(lead_A, lead_B)
-    # trail = min(trail_A, trail_B)
-    # trim_aln_A = aligned_A[lead:trail]
-    # trim_aln_B = aligned_B[lead:trail]
-    # mismatch = ''.join(['+' if a!=b else ' ' for (a,b) in zip(trim_aln_A, trim_aln_B)])
-
-    # Calculate (gapless) sequence identity
-    seq_id, g_seq_id = _calculate_identity(aligned_A, aligned_B)
-    return ((aligned_A, aligned_B), seq_id, g_seq_id, mapping)
-    # return ((trim_aln_A, trim_aln_B, mismatch), seq_id, g_seq_id, mapping)
-
-def parse_structure(spath):
-    """Parses a PDB/cif structure"""
-
-    if not os.path.isfile(spath):
-        return IOError('File not found: {0}'.format(spath))
-
-    if spath.endswith(('pdb', 'ent')):
+def parse_structure(filepath: str) -> Structure:
+    """Parse a crystal structure from a PDB or CIF file."""
+    if not os.path.isfile(filepath):
+        return IOError('File not found: {0}'.format(filepath))
+    if filepath.endswith(('pdb', 'ent')):
         parser = PDBParser()
-    elif spath.endswith('cif'):
+    elif filepath.endswith('cif'):
         parser = FastMMCIFParser()
     else:
-        raise Exception('Format not supported ({0}). Must be .pdb/.ent or .cif'.format(spath))
+        raise Exception('Format not supported ({0}). Must be .pdb/.ent or .cif'.format(filepath))
+    basename = Path(filepath).stem
+    return parser.get_structure(basename, filepath)
 
-    sname = os.path.basename(spath.split('.')[0])
-    return parser.get_structure(sname, spath)
-##
 
-def run(refe, mobi, r_chain='A',m_chain='A'):
+def download_structure(pdbid: str, mirror: str = 'wwPDB') -> str:
+    """Download a structure as an mmCIF file from one mirror of the PDB in the current folder.
 
-    #p= argparse.ArgumentParser(description=__doc__)
-    #p.add_argument('refe', help='Reference Structure')
-    #p.add_argument('--r_chain', default='A', help='Reference Structure Chain')
-    #p.add_argument('mobi', help='Mobile Structure')
-    #p.add_argument('--m_chain', default='A', help='Reference Structure Chain')
-    #line = ap.parse_args()
-    
-    args= {'refe':refe,'mobi':mobi,'r_chain':r_chain,'m_chain':m_chain}
-    
-    cline = Namespace(**args)
+    :param pdbid: PDB ID of the structure to download.
+    :param mirror: Mirror of the PDB ('PDB', 'wwPDB', 'PDBe', or 'PDBj'). Is case-insensitive.
+    """
+    mirror = mirror.lower()
+    if mirror == 'wwpdb':
+        pdb = PDBList(server='https://files.wwpdb.org', verbose=False)
+        pdb.retrieve_pdb_file(pdbid, file_format='mmCif', pdir='.')
+        return f'./{pdbid}.cif'
+    elif mirror == 'pdbe':
+        url = "https://www.ebi.ac.uk/pdbe/entry-files/download/" + pdbid + ".cif"
+    elif mirror == 'pdbj':
+        url = "https://data.pdbj.org/pub/pdb/data/structures/divided/mmCIF/" + pdbid[1:3] +"/" + pdbid + ".cif"
+    elif mirror in ['pdb', 'rcsb']:
+        url = "http://www.rcsb.org/pdb/files/" + pdbid + ".cif"
+    content = requests.get(url).text
+    with open(f'./{pdbid}.cif', 'w') as oh:
+        oh.write(content)
+    return f'./{pdbid}.cif'
 
-    # Parse structures & take only the necessary chain
-    s_reference = parse_structure(cline.refe)
-    try:
-        reference = s_reference[0][cline.r_chain]
-    except KeyError:
-        raise Exception('Chain {0} not found in reference structure'.format(cline.r_chain))
 
-    s_mobile = parse_structure(cline.mobi)
-    try:
-        mobile = s_mobile[0][cline.m_chain]
-    except KeyError:
-        raise Exception('Chain {0} not found in mobile structure'.format(cline.m_chain))
+class ResSelect(Select):
 
-    # Align sequences to get mapping between residues
-    aln, seq_id, gapless_id, res_map = align_sequences(reference, mobile)
+    def __init__(self, ligand):
+        self.ligand_id = ligand
 
-    refe_ca_list, mobi_ca_list = [], []
-    for refe_res in res_map:
-        refe_ca_list.append(reference[refe_res]['CA'])
-        mobi_ca_list.append(mobile[res_map[refe_res]]['CA'])
+    def accept_residue(self, residue):
+        if residue.get_resname() == self.ligand_id:
+            return 1
+        else:
+            return 0
 
-    # Superimpose matching residues
-    si = Superimposer()
-    si.set_atoms(refe_ca_list, mobi_ca_list)
+class NonHetSelect(Select):
 
-    # Transform & Write Mobile
-    si.apply(mobile.get_atoms())
-
-    io = PDBIO()
-    io.set_structure(mobile)
-    m_transformed_name = '{0}_transformed.pdb'.format(s_mobile.id)
-    io.save(m_transformed_name)
+    def accept_residue(self, residue):
+        return 1 if residue.id[0] == " " else 0
