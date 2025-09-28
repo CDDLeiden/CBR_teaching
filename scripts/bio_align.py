@@ -8,9 +8,10 @@ import os
 from pathlib import Path
 
 import requests
+import numpy as np
 from Bio.Align import substitution_matrices, PairwiseAligner
 from Bio.Data.PDBData import protein_letters_3to1
-from Bio.PDB import PDBParser, FastMMCIFParser, Superimposer, PDBIO, Structure, Select
+from Bio.PDB import PDBParser, FastMMCIFParser, Superimposer, PDBIO, MMCIFIO, Structure, Select, Model, Chain
 from Bio.PDB.PDBList import PDBList
 from Bio.PDB.Polypeptide import is_aa
 
@@ -154,27 +155,114 @@ def parse_structure(filepath: str) -> Structure:
     return parser.get_structure(basename, filepath)
 
 
-def download_structure(pdbid: str, mirror: str = 'wwPDB') -> str:
+def write_structure(structure: Structure, filepath: str, pdb_format: str = 'pdb') -> None:
+    """Write a structure to a file."""
+    if pdb_format not in ('pdb', 'ent', 'cif'):
+        raise ValueError('format must be either "pdb" or "cif".')
+    if pdb_format in ('pdb', 'ent'):
+        io = PDBIO()
+    else:
+        io = MMCIFIO()
+    io.set_structure(structure)
+    io.save(filepath)
+
+
+def download_structure(pdbid: str, mirror: str = 'wwPDB', pdb_format: str = 'pdb', chain_id: str = None, ligand_to_keep: str | list[str] = None) -> str:
     """Download a structure as an mmCIF file from one mirror of the PDB in the current folder.
 
     :param pdbid: PDB ID of the structure to download.
     :param mirror: Mirror of the PDB ('PDB', 'wwPDB', 'PDBe', or 'PDBj'). Is case-insensitive.
+    :param pdb_format:
+    :param chain_id: chain to keep (all others are removed). Set to None to keep all.
+    :param ligand_to_keep: All ligands but the one(s) specified are dropped from the structure. If None, keep all.
     """
+    if pdb_format not in ['pdb', 'cif']:
+        raise ValueError('format must be either "pdb" or "cif".')
     mirror = mirror.lower()
     if mirror == 'wwpdb':
         pdb = PDBList(server='https://files.wwpdb.org', verbose=False)
-        pdb.retrieve_pdb_file(pdbid, file_format='mmCif', pdir='.')
-        return f'./{pdbid}.cif'
+        outname = pdb.retrieve_pdb_file(pdbid, file_format=('mmCif' if pdb_format == 'cif' else 'pdb'), pdir='.')
+        _ = os.rename(outname, f'./{pdbid}.{pdb_format}')
+        url = None
     elif mirror == 'pdbe':
-        url = "https://www.ebi.ac.uk/pdbe/entry-files/download/" + pdbid + ".cif"
+        url = "https://www.ebi.ac.uk/pdbe/entry-files/download/" + pdbid + f'.{pdb_format}'
     elif mirror == 'pdbj':
-        url = "https://data.pdbj.org/pub/pdb/data/structures/divided/mmCIF/" + pdbid[1:3] +"/" + pdbid + ".cif"
+        if pdb_format == 'cif':
+            url = "https://data.pdbj.org/pub/pdb/data/structures/divided/mmCIF/" + pdbid[1:3] +"/" + pdbid + ".cif"
+        else:
+            url = "https://data.pdbj.org/pub/pdb/data/structures/divided/pdb/" + pdbid[1:3] +"/pdb" + pdbid + ".ent"
     elif mirror in ['pdb', 'rcsb']:
-        url = "http://www.rcsb.org/pdb/files/" + pdbid + ".cif"
-    content = requests.get(url).text
-    with open(f'./{pdbid}.cif', 'w') as oh:
-        oh.write(content)
-    return f'./{pdbid}.cif'
+        url = "http://www.rcsb.org/pdb/files/" + pdbid + f'.{pdb_format}'
+    if url is not None:
+        content = requests.get(url).text
+        with open(f'./{pdbid}.cif', 'w') as oh:
+            oh.write(content)
+    if chain_id is not None:
+        # Read the file
+        structure = parse_structure(f'./{pdbid}.{pdb_format}')
+        structure = extract_chain_with_ligands(structure, chain_id=chain_id, ligand_to_keep=ligand_to_keep)
+        write_structure(structure=structure, filepath=f'./{pdbid}.{pdb_format}', pdb_format=pdb_format)
+    return f'./{pdbid}.{pdb_format}'
+
+
+def get_min_distance(chain, ligand):
+    """Calculates the minimum distance between a ligand and a protein chain."""
+    min_dist = float('inf')
+    for residue in chain:
+        for atom in residue:
+            for ligand_atom in ligand:
+                dist = np.linalg.norm(atom.coord - ligand_atom.coord)
+                if dist < min_dist:
+                    min_dist = dist
+    return min_dist
+
+
+def extract_chain_with_ligands(structure, chain_id, ligand_to_keep):
+    """
+    Extracts a specific chain and its associated ligands from a BioPython Structure.
+
+    Args:
+        structure (Bio.PDB.Structure.Structure): The input BioPython Structure object.
+        chain_id (str): The ID of the chain to extract.
+        ligand_to_keep (str, optional): The name of the ligands, lying within 2 angstroms of the protein, that are kept.
+
+    Returns:
+        Bio.PDB.Structure.Structure: A new Structure object containing the desired
+                                     chain and its ligands.
+    """
+    new_structure = Structure.Structure("extracted_chain")
+    new_model = Model.Model(0)
+    new_chain = Chain.Chain(chain_id)
+    target_chain_residues = []
+    ligands_to_add = set()
+    for model in structure:
+        # First, get all residues of the target protein chain
+        for chain in model:
+            if chain.id == chain_id:
+                for residue in chain:
+                    # We are only interested in standard amino acids for the protein part
+                    if residue.id[0] == ' ':
+                        target_chain_residues.append(residue.copy())
+        # Now, find all ligands in the original structure
+        for chain in model:
+            for ligand in chain:
+                if ligand_to_keep is None:
+                    ligands_to_add.add(ligand)
+                elif ligand.id[0] == f'H_{ligand_to_keep}':
+                    # Calculate the minimum distance between the ligand and the target chain
+                    if get_min_distance(target_chain_residues, ligand) <= 4:
+                        ligands_to_add.add(ligand)
+    # Add the protein residues and the associated ligands to the new chain
+    for res in target_chain_residues:
+        new_chain.add(res)
+    for lig in ligands_to_add:
+        try:
+            new_chain.add(lig)
+        except:
+            pass
+    new_model.add(new_chain)
+    new_structure.add(new_model)
+    return new_structure
 
 
 class ResSelect(Select):
